@@ -1,0 +1,354 @@
+# Power BI / Fabric CI starter pipeline for introducing Power BI Developers to CI/CD process
+#
+# Validates:
+# - Semantic models with Tabular Editor BPA
+# - Reports with PBI/Fabric Inspector when runInspector is enabled
+#
+# Required files:
+# - BPARules/BPARules-standard.json (the best option is to get direct upload, we can add script to get rules URL, but my personal preference are Azure DevOps artifacts that can be used across tenant Build Agents easily)
+# - ReportRules/Rules-Report-V2.json, only when runInspector is enabled
+#
+# Deployment stages are placeholders only. As it require Authorization setup (UAMI or Service Principal with contributor role to workspaces)
+
+parameters:
+  - name: runInspector
+    displayName: 'Run PBI/Fabric Inspector report rules?'
+    type: boolean
+    default: false
+
+  - name: deployToTest
+    displayName: 'Run Test deployment placeholder?'
+    type: boolean
+    default: false
+
+  - name: deployToProd
+    displayName: 'Run Production deployment placeholder?'
+    type: boolean
+    default: false
+
+trigger:
+  branches:
+    include:
+      - develop
+
+pr:
+  branches:
+    include:
+      - develop
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  bpaRulesPath: '$(Build.SourcesDirectory)\BPARules\BPARules-standard.json'
+  reportRulesPath: '$(Build.SourcesDirectory)\ReportRules\Rules-Report-V2.json'
+
+  # Pinned tool versions and reviewed SHA256 hashes
+  tabularEditorVersion: '2.27.2'
+  tabularEditorSha256: 'A54CEC0E6C943C1A0270EE56913D5E2CCCDA3C603AA300F3292C279F58BD6206'
+
+  inspectorVersion: 'v3.4.0'
+  inspectorSha256: 'DE97991499B83CAB15264EA6AE7A39E430277AC526A3E30F9846EA6B24BD2E80'
+stages:
+  - stage: Build
+    displayName: 'Validate Power BI Project'
+    jobs:
+
+      # -----------------------------------------------------------------------
+      # Semantic model validation
+      # -----------------------------------------------------------------------
+
+      - job: ValidateSemanticModels
+        displayName: 'Validate Semantic Models'
+        steps:
+          - checkout: self
+            clean: true
+            fetchDepth: 1
+
+          - task: PowerShell@2
+            displayName: 'Download Tabular Editor'
+            inputs:
+              targetType: 'inline'
+              pwsh: true
+              script: |
+                Set-StrictMode -Version Latest
+                $ErrorActionPreference = 'Stop'
+
+                $version = "$(tabularEditorVersion)"
+                $expectedHash = "$(tabularEditorSha256)".ToUpperInvariant()
+                $toolsDir = "$env:BUILD_SOURCESDIRECTORY\_Tools\TE"
+                $toolPath = "$toolsDir\TabularEditor.exe"
+                $zipFile = "$env:AGENT_TEMPDIRECTORY\TabularEditor.$version.zip"
+                $downloadUrl = "https://github.com/TabularEditor/TabularEditor/releases/download/$version/TabularEditor.$version.zip"
+
+                if (Test-Path $toolPath) {
+                    Write-Host "Tabular Editor already present at $toolPath"
+                    return
+                }
+
+                New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
+
+                try {
+                    Write-Host "Downloading Tabular Editor $version"
+                    Invoke-WebRequest -Uri $downloadUrl -OutFile $zipFile -UseBasicParsing
+
+                    $actualHash = (Get-FileHash $zipFile -Algorithm SHA256).Hash.ToUpperInvariant()
+                    Write-Host "Expected SHA256: $expectedHash"
+                    Write-Host "Actual SHA256: $actualHash"
+
+                    if ($actualHash -ne $expectedHash) {
+                        Write-Host "##vso[task.logissue type=error]Tabular Editor SHA256 mismatch. Expected $expectedHash, got $actualHash."
+                        throw "Tabular Editor failed integrity verification."
+                    }
+
+                    Expand-Archive -Path $zipFile -DestinationPath $toolsDir -Force
+
+                    if (-not (Test-Path $toolPath)) {
+                        throw "TabularEditor.exe was not found after extraction: $toolPath"
+                    }
+
+                    Write-Host "Tabular Editor $version ready at $toolPath"
+                }
+                finally {
+                    Remove-Item $zipFile -Force -ErrorAction SilentlyContinue
+                }
+
+          - task: PowerShell@2
+            displayName: 'Run Semantic Model Rules'
+            inputs:
+              targetType: 'inline'
+              pwsh: true
+              script: |
+                Set-StrictMode -Version Latest
+                $ErrorActionPreference = 'Stop'
+
+                $scanPath = $env:BUILD_SOURCESDIRECTORY
+                $toolPath = "$scanPath\_Tools\TE\TabularEditor.exe"
+                $rulesPath = "$(bpaRulesPath)"
+
+                if (-not (Test-Path $toolPath)) {
+                    throw "Tabular Editor not found: $toolPath"
+                }
+
+                if (-not (Test-Path $rulesPath)) {
+                    throw "Rules file not found: $rulesPath"
+                }
+
+                $modelDirectories = Get-ChildItem -Path $scanPath -Recurse -File |
+                    Where-Object { $_.Extension -in @('.pbidataset', '.pbism') } |
+                    ForEach-Object { $_.Directory.FullName } |
+                    Sort-Object -Unique
+
+                if (-not $modelDirectories) {
+                    Write-Host "##vso[task.logissue type=warning]No .pbidataset or .pbism files were found."
+                    return
+                }
+
+                $failures = 0
+                $validated = 0
+
+                foreach ($modelDirectory in $modelDirectories) {
+                    $definitionPath = Join-Path $modelDirectory 'definition'
+                    $bimPath = Join-Path $modelDirectory 'model.bim'
+
+                    if (Test-Path $definitionPath) {
+                        $modelPath = $definitionPath
+                    }
+                    elseif (Test-Path $bimPath) {
+                        $modelPath = $bimPath
+                    }
+                    else {
+                        Write-Warning "No definition folder or model.bim found in $modelDirectory"
+                        continue
+                    }
+
+                    $validated++
+                    Write-Host "##[group]Running BPA on: $modelPath"
+
+                    try {
+                        $process = Start-Process -FilePath $toolPath `
+                            -ArgumentList "`"$modelPath`" -A `"$rulesPath`" -V" `
+                            -NoNewWindow -Wait -PassThru
+
+                        if ($process.ExitCode -ne 0) {
+                            $failures++
+                            Write-Host "##vso[task.logissue type=error]BPA failed for $modelPath with exit code $($process.ExitCode)."
+                        }
+                    }
+                    catch {
+                        $failures++
+                        Write-Host "##vso[task.logissue type=error]BPA failed for $modelPath. $($_.Exception.Message)"
+                    }
+                    finally {
+                        Write-Host "##[endgroup]"
+                    }
+                }
+
+                Write-Host "Semantic models validated: $validated"
+                Write-Host "Validation failures: $failures"
+
+                if ($validated -eq 0) {
+                    throw "No supported semantic models could be validated."
+                }
+
+                if ($failures -gt 0) {
+                    throw "$failures semantic model validation operation(s) failed."
+                }
+
+      # -----------------------------------------------------------------------
+      # Optional report validation
+      # -----------------------------------------------------------------------
+
+      - ${{ if eq(parameters.runInspector, true) }}:
+        - job: ValidateReports
+          displayName: 'Validate Reports'
+          steps:
+            - checkout: self
+              clean: true
+              fetchDepth: 1
+
+            - task: PowerShell@2
+              displayName: 'Download PBI/Fabric Inspector'
+              inputs:
+                targetType: 'inline'
+                pwsh: true
+                script: |
+                  Set-StrictMode -Version Latest
+                  $ErrorActionPreference = 'Stop'
+
+                  $version = "$(inspectorVersion)"
+                  $expectedHash = "$(inspectorSha256)".ToUpperInvariant()
+                  $toolsDir = "$env:BUILD_SOURCESDIRECTORY\_Tools\PBIInspector"
+                  $zipFile = "$env:AGENT_TEMPDIRECTORY\PBIInspector.$version.zip"
+                  $downloadUrl = "https://github.com/NatVanG/fab-inspector/releases/download/$version/win-x64-CLI.zip"
+
+                  New-Item -ItemType Directory -Path $toolsDir -Force | Out-Null
+
+                  try {
+                      Write-Host "Downloading PBI/Fabric Inspector $version"
+                      Invoke-WebRequest -Uri $downloadUrl -OutFile $zipFile -UseBasicParsing
+
+                      $actualHash = (Get-FileHash $zipFile -Algorithm SHA256).Hash.ToUpperInvariant()
+                      Write-Host "Expected SHA256: $expectedHash"
+                      Write-Host "Actual SHA256: $actualHash"
+
+                      if ($actualHash -ne $expectedHash) {
+                          Write-Host "##vso[task.logissue type=error]PBI/Fabric Inspector SHA256 mismatch. Expected $expectedHash, got $actualHash."
+                          throw "PBI/Fabric Inspector failed integrity verification."
+                      }
+
+                      Expand-Archive -Path $zipFile -DestinationPath $toolsDir -Force
+
+                      $toolPath = Get-ChildItem -Path $toolsDir -Recurse -Filter '*CLI.exe' |
+                          Select-Object -First 1 -ExpandProperty FullName
+
+                      if (-not $toolPath) {
+                          throw "PBI/Fabric Inspector executable not found under $toolsDir"
+                      }
+
+                      Write-Host "PBI/Fabric Inspector $version ready at $toolPath"
+                  }
+                  finally {
+                      Remove-Item $zipFile -Force -ErrorAction SilentlyContinue
+                  }
+
+            - task: PowerShell@2
+              displayName: 'Run Report Rules'
+              inputs:
+                targetType: 'inline'
+                pwsh: true
+                script: |
+                  Set-StrictMode -Version Latest
+                  $ErrorActionPreference = 'Stop'
+
+                  $scanPath = $env:BUILD_SOURCESDIRECTORY
+                  $rulesPath = "$(reportRulesPath)"
+                  $toolsDir = "$scanPath\_Tools\PBIInspector"
+
+                  if (-not (Test-Path $rulesPath)) {
+                      throw "Rules file not found: $rulesPath"
+                  }
+
+                  $toolPath = Get-ChildItem -Path $toolsDir -Recurse -Filter '*CLI.exe' |
+                      Select-Object -First 1 -ExpandProperty FullName
+
+                  if (-not $toolPath) {
+                      throw "PBI/Fabric Inspector executable not found under $toolsDir"
+                  }
+
+                  $env:DOTNET_ROLL_FORWARD = 'Major'
+
+                  $reportDirectories = Get-ChildItem -Path $scanPath -Recurse -File -Filter '*.pbir' |
+                      ForEach-Object { $_.Directory.FullName } |
+                      Sort-Object -Unique
+
+                  if (-not $reportDirectories) {
+                      Write-Host "##vso[task.logissue type=warning]No .pbir files were found."
+                      return
+                  }
+
+                  $failures = 0
+                  $validated = 0
+
+                  foreach ($reportDirectory in $reportDirectories) {
+                      $validated++
+                      Write-Host "##[group]Running report rules on: $reportDirectory"
+
+                      try {
+                          $process = Start-Process -FilePath $toolPath `
+                              -ArgumentList "-fabricitem `"$reportDirectory`" -rules `"$rulesPath`" -formats `"ADO`"" `
+                              -NoNewWindow -Wait -PassThru
+
+                          if ($process.ExitCode -ne 0) {
+                              $failures++
+                              Write-Host "##vso[task.logissue type=error]Report validation failed for $reportDirectory with exit code $($process.ExitCode)."
+                          }
+                      }
+                      catch {
+                          $failures++
+                          Write-Host "##vso[task.logissue type=error]Report validation failed for $reportDirectory. $($_.Exception.Message)"
+                      }
+                      finally {
+                          Write-Host "##[endgroup]"
+                      }
+                  }
+
+                  Write-Host "Reports validated: $validated"
+                  Write-Host "Validation failures: $failures"
+
+                  if ($failures -gt 0) {
+                      throw "$failures report validation operation(s) failed."
+                  }
+
+  # ---------------------------------------------------------------------------
+  # Deployment placeholders
+  # ---------------------------------------------------------------------------
+
+  - ${{ if eq(parameters.deployToTest, true) }}:
+    - stage: DeployTest
+      displayName: 'Deploy to Test Workspace'
+      dependsOn: Build
+      condition: succeeded()
+      jobs:
+        - job: DeployTestPlaceholder
+          displayName: 'Test Deployment Not Implemented'
+          steps:
+            - checkout: none
+
+            - powershell: |
+                Write-Host "##vso[task.logissue type=warning]Deployment to Test is not implemented in this starter pipeline."
+              displayName: 'Test Deployment Placeholder'
+
+  - ${{ if eq(parameters.deployToProd, true) }}:
+    - stage: DeployProd
+      displayName: 'Deploy to Production Workspace'
+      dependsOn: Build
+      condition: succeeded()
+      jobs:
+        - job: DeployProdPlaceholder
+          displayName: 'Production Deployment Not Implemented'
+          steps:
+            - checkout: none
+
+            - powershell: |
+                Write-Host "##vso[task.logissue type=warning]Deployment to Production is not implemented in this starter pipeline."
